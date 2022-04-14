@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+######
+# Optional:
+# Modify instance type and AMI image
+######
+
+Parameters:
+
+  InstanceTypeParameter:
+    Type: String
+    Default: t2.medium
+    Description: Enter instance size.
+
+  # Use Amazon Linux 2 AMI for C2 servers
+  AMI:
+    Type: String
+    Default: ami-0c02fb55956c7d316
+    Description: The Linux AMI to use.
+
+######
+# Part 1:
+# Create the core VPC/subnet components
+######
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-InternetGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: us-east-1a  # Change to desired AZ
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Subnet
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-RouteTable
+
+  # Make sure instances in subnet can access the internet
+  RouteInternetAccess:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Apply internet-accessible routing table to subnets
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+######
+# Part 2:
+# Create Security Groups and C2 Instances
+######
+
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ec2.amazonaws.com ]
+            Action:
+              - sts:AssumeRole
+      Path: /
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref Ec2InstanceRole ]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-SecurityGroup
+      GroupDescription: "Only 80 and 443 traffic allowed. Use SSM to connect to instance cli."
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-SecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 10.0.0.0/24
+          FromPort: 443
+          ToPort: 443
+        - IpProtocol: tcp
+          CidrIp: 10.0.0.0/24
+          FromPort: 1024
+          ToPort: 65535
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  C2Server:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType:
+        Ref: InstanceTypeParameter
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref Subnet
+          GroupSet:
+            - Ref: SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: "10"
+            DeleteOnTermination: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-C2Server
+
+######
+# Part 3:
+# TODO: Create Lambda Redirector
+######
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-LambdaRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-LambdaRole-Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DeleteNetworkInterface
+                - ec2:DescribeInstances
+                - ec2:AttachNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Path: /
+
+  LambdaRedirector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-LambdaRedirector
+      Description: Lamda Function used as a redirector to TEAMSERVER
+      Handler: index.redirector
+      Runtime: python3.8
+      Role: !GetAtt LambdaRole.Arn
+      VpcConfig:
+        SubnetIds: 
+        - !Ref Subnet
+        SecurityGroupIds:
+        - !Ref SecurityGroup
+      Environment:
+        Variables:
+          TEAMSERVER: !GetAtt C2Server.PrivateIp
+      Code:
+        ZipFile: |
+          import base64
+          import os
+          import urllib3
+
+          from pprint import pprint
+
+
+          def redirector(event, context):
+
+              print(event)
+
+              #######
+              # Forward HTTP request to C2
+              #######
+
+              http = urllib3.PoolManager(cert_reqs = 'CERT_NONE')
+
+              # Setup forwarding URL
+              teamserver = os.getenv("TEAMSERVER")
+              url = "https://" + teamserver + event["requestContext"]["http"]["path"]
+
+              # Parse Query String Parameters
+              queryStrings = {}
+              if "queryStringParameters" in event.keys():
+                  for key, value in event["queryStringParameters"].items():
+                      queryStrings[key] = value
+
+              # Parse HTTP headers
+              inboundHeaders = {}
+              for key, value in event["headers"].items():
+                  inboundHeaders[key] = value
+
+              # Handle potential base64 encodng of body
+              body = ""
+              if "body" in event.keys():
+                  if event["isBase64Encoded"]:
+                      body = base64.b64decode(event["body"])
+                  else:
+                      body = event["body"]
+
+              # Forward request to C2
+              resp = http.request(event["requestContext"]["http"]["method"], url, headers=inboundHeaders, fields=queryStrings, body=body)
+
+              ########
+              # Return response to beacon
+              ########
+
+              # Parse outbound HTTP headers
+              outboundHeaders = {}
+              for i in range(len(resp.headers.items())):
+                  outboundHeaders[resp.headers.items()[i][0]] = resp.headers.items()[i][1]
+
+              # build response to beacon
+              response = {
+                  "statusCode": resp.status,
+                  "body": resp.data.decode('utf-8'),
+                  "headers": outboundHeaders
+              }
+
+              return response
+  
+  LambdaRedirectorURL:
+    Type: AWS::Lambda::Url
+    DependsOn: LambdaRedirector
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt LambdaRedirector.Arn
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt LambdaRedirector.Arn
+      FunctionUrlAuthType: NONE
+      Principal: '*'
+
+
+######
+# Part 4:
+# Output C2 public IP addresses
+######
+
+Outputs:
+  C2PublicIP:
+    Description: "C2 Public IP"
+    Value: !GetAtt C2Server.PublicIp
