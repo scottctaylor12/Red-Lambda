@@ -262,6 +262,7 @@ Resources:
               for head, val in resp.headers.items():
                   outboundHeaders[head] = val
 
+              # build response to beacon
               response = {
                   "statusCode": resp.status_code
               }
