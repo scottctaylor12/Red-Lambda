@@ -56,9 +56,19 @@ def redirector(event, context):
 
     # build response to beacon
     response = {
-        "statusCode": resp.status_code,
-        "body": resp.text,
-        "headers": outboundHeaders
+        "statusCode": resp.status_code
     }
+    
+    # check to see if response is utf8 decodable, otherwise we will assume binary and encode it, gateway decodes on receipt
+    try:
+        response['body'] = resp.content.decode('utf8')
+        outboundHeaders['X-EncodedResponse'] = 'False'
+        response['isBase64Encoded'] = False
+    except:
+        response['body'] = base64.b64encode(resp.content).decode('utf8')
+        outboundHeaders['X-EncodedResponse'] = 'True'
+        response['isBase64Encoded'] = True
+        
+    response['headers'] = outboundHeaders
 
     return response
